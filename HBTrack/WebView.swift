@@ -14,6 +14,9 @@ struct WebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
+        // Clear cached JS/CSS files on startup to ensure latest bundle loads
+        WKWebsiteDataStore.default().removeData(ofTypes: [WKWebsiteDataStoreRecordTypeDiskCache, WKWebsiteDataStoreRecordTypeMemoryCache], modifiedSince: Date(timeIntervalSince1970: 0)) {}
+
         let configuration = WKWebViewConfiguration()
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
@@ -41,7 +44,7 @@ struct WebView: UIViewRepresentable {
         }
         #endif
 
-        let request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 30.0)
+        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30.0)
         webView.load(request)
         return webView
     }
@@ -49,7 +52,7 @@ struct WebView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {
         if reloadTrigger != context.coordinator.lastReloadTrigger {
             context.coordinator.lastReloadTrigger = reloadTrigger
-            let request = URLRequest(url: url)
+            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30.0)
             uiView.load(request)
         }
     }
