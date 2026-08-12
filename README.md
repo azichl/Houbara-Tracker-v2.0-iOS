@@ -15,6 +15,7 @@ The app uses a lightweight SwiftUI `WKWebView` wrapper to load the React web app
 | **10/08/2026 11:15** | `e0e8b86` (ios) | Fixed live map weather layer zoom/navigation resets + optimized PTT history load speed & iOS UI responsiveness |
 | **12/08/2026 08:45** | `311e268` (web) | Restored complete tracking history query & 100% marker rendering without limit truncation for 1 year, 2 years, and custom dates |
 | **12/08/2026 12:55** | `ecc4d58` (web) | Format Last Ingest using data update execution timestamp in device system local timezone |
+| **12/08/2026 13:05** | `f313f7f` (web) | Real-time Firestore ingestion listener for instant synchronization between Web and iOS app |
 
 ---
 
