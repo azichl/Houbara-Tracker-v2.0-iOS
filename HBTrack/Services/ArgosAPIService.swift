@@ -198,25 +198,25 @@ class ArgosAPIService {
         return allItems
     }
     
+    private func parseCoord(_ val: Any?) -> Double? {
+        if let d = val as? Double { return d }
+        if let num = val as? NSNumber { return num.doubleValue }
+        if let s = val as? String { return Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+
     /// Parse raw telemetry items into standard Position and Argos models (matching Web App logic)
     func mapRawTelemetry(_ rawItems: [[String: Any]]) -> (positions: [[String: Any]], argosPositions: [[String: Any]], txLastFixes: [String: TransmitterSyncInfo]) {
         var parsedPositions: [[String: Any]] = []
         var parsedArgos: [[String: Any]] = []
         var txLastFixes: [String: TransmitterSyncInfo] = [:]
         
-        func parseCoord(_ val: Any?) -> Double? {
-            if let d = val as? Double { return d }
-            if let num = val as? NSNumber { return num.doubleValue }
-            if let s = val as? String { return Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
-            return nil
-        }
-        
         for item in rawItems {
             // Coordinate extraction
             let rawLat = parseCoord(item["gpsLocLat"]) ?? parseCoord(item["dopplerLocLat"]) ?? parseCoord((item["location"] as? [String: Any])?["latitude"])
             let rawLon = parseCoord(item["gpsLocLon"]) ?? parseCoord(item["dopplerLocLon"]) ?? parseCoord((item["location"] as? [String: Any])?["longitude"])
             
-            guard let lat = rawLat, var lon = rawLon, lat != 0, lon != 0, !lat.isNaN, !lon.isNaN, abs(lat) <= 90, abs(lon) <= 180 else {
+            guard let lat = rawLat, var lon = rawLon, lat != 0, lon != 0, !lat.isNaN, !lon.isNaN, abs(lat) <= 90, abs(lon) <= 180, !(abs(lat) < 1 && abs(lon) < 1) else {
                 continue
             }
             
@@ -342,6 +342,98 @@ class ArgosAPIService {
         return nil
     }
     
+    private struct PlausibleAnchor {
+        let lat: Double
+        let lon: Double
+        let tsSec: TimeInterval
+    }
+
+    private func haversineKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double) -> Double {
+        let r = 6371.0
+        let dLat = (lat2 - lat1) * .pi / 180.0
+        let dLon = (lon2 - lon1) * .pi / 180.0
+        let a = sin(dLat / 2) * sin(dLat / 2) +
+            cos(lat1 * .pi / 180.0) * cos(lat2 * .pi / 180.0) *
+            sin(dLon / 2) * sin(dLon / 2)
+        let c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        return r * c
+    }
+
+    private func isPlausibleFlightMovement(lat1: Double, lon1: Double, t1Sec: TimeInterval, lat2: Double, lon2: Double, t2Sec: TimeInterval) -> Bool {
+        let dtHours = max(0.001, abs(t2Sec - t1Sec) / 3600.0)
+        let distKm = haversineKm(lat1: lat1, lon1: lon1, lat2: lat2, lon2: lon2)
+        let maxAllowedKm = dtHours <= 12.0
+            ? (120.0 * dtHours + 15.0)
+            : (1440.0 + 50.0 * (dtHours - 12.0) + 15.0)
+        return distKm <= maxAllowedKm
+    }
+
+    private func filterPlausibleRecords(
+        _ records: [[String: Any]],
+        anchors: [String: PlausibleAnchor]
+    ) -> (accepted: [[String: Any]], rejectedCount: Int) {
+        var byPtt: [String: [[String: Any]]] = [:]
+        for rec in records {
+            let ptt = (rec["platformId"] as? String ?? rec["transmitter_id"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ptt.isEmpty else { continue }
+            byPtt[ptt, default: []].append(rec)
+        }
+
+        var accepted: [[String: Any]] = []
+        var rejectedCount = 0
+
+        for (ptt, group) in byPtt {
+            let sorted = group.sorted {
+                let t0 = DateFormatters.parseDate($0["locationDate"] as? String ?? $0["timestamp"] as? String ?? "")?.timeIntervalSince1970 ?? 0
+                let t1 = DateFormatters.parseDate($1["locationDate"] as? String ?? $1["timestamp"] as? String ?? "")?.timeIntervalSince1970 ?? 0
+                return t0 < t1
+            }
+
+            let anchor = anchors[ptt]
+            var startIdx = 0
+
+            if anchor == nil && sorted.count >= 3 {
+                let lat0 = sorted[0]["lat"] as? Double ?? 0
+                let lon0 = sorted[0]["lon"] as? Double ?? 0
+                let t0 = DateFormatters.parseDate(sorted[0]["locationDate"] as? String ?? sorted[0]["timestamp"] as? String ?? "")?.timeIntervalSince1970 ?? 0
+                let lat1 = sorted[1]["lat"] as? Double ?? 0
+                let lon1 = sorted[1]["lon"] as? Double ?? 0
+                let t1 = DateFormatters.parseDate(sorted[1]["locationDate"] as? String ?? sorted[1]["timestamp"] as? String ?? "")?.timeIntervalSince1970 ?? 0
+                let lat2 = sorted[2]["lat"] as? Double ?? 0
+                let lon2 = sorted[2]["lon"] as? Double ?? 0
+                let t2 = DateFormatters.parseDate(sorted[2]["locationDate"] as? String ?? sorted[2]["timestamp"] as? String ?? "")?.timeIntervalSince1970 ?? 0
+
+                let p01 = isPlausibleFlightMovement(lat1: lat0, lon1: lon0, t1Sec: t0, lat2: lat1, lon2: lon1, t2Sec: t1)
+                let p12 = isPlausibleFlightMovement(lat1: lat1, lon1: lon1, t1Sec: t1, lat2: lat2, lon2: lon2, t2Sec: t2)
+                let p02 = isPlausibleFlightMovement(lat1: lat0, lon1: lon0, t1Sec: t0, lat2: lat2, lon2: lon2, t2Sec: t2)
+                if !p01 && p12 && !p02 {
+                    rejectedCount += 1
+                    startIdx = 1
+                }
+            }
+
+            var lastValid: PlausibleAnchor? = nil
+            for i in startIdx..<sorted.count {
+                let rec = sorted[i]
+                guard let lat = rec["lat"] as? Double,
+                      let lon = rec["lon"] as? Double,
+                      let tSec = DateFormatters.parseDate(rec["locationDate"] as? String ?? rec["timestamp"] as? String ?? "")?.timeIntervalSince1970 else {
+                    rejectedCount += 1
+                    continue
+                }
+                let ref: PlausibleAnchor? = lastValid ?? (anchor != nil && tSec >= anchor!.tsSec ? anchor : nil)
+                if let r = ref, !isPlausibleFlightMovement(lat1: r.lat, lon1: r.lon, t1Sec: r.tsSec, lat2: lat, lon2: lon, t2Sec: tSec) {
+                    rejectedCount += 1
+                    continue
+                }
+                accepted.append(rec)
+                lastValid = PlausibleAnchor(lat: lat, lon: lon, tsSec: tSec)
+            }
+        }
+
+        return (accepted, rejectedCount)
+    }
+
     /// Full End-to-End Sync Pipeline: Auth -> Fetch Bulk -> Map -> Write to Firebase
     func syncArgosData(
         username: String,
@@ -373,11 +465,66 @@ class ArgosAPIService {
         
         // 3. Map items to Firestore positions schema
         logHandler("Mapping and validating \(rawItems.count) telemetry records...")
-        let (positions, argosPositions, txLastFixes) = mapRawTelemetry(rawItems)
-        logHandler("Valid positions extracted: \(positions.count).")
-        
-        // 4. Batch write to Firestore
+        let (rawPositions, rawArgosPositions, rawTxLastFixes) = mapRawTelemetry(rawItems)
+
+        // Fetch existing transmitters upfront for both anchor-based speed validation and metadata updates
         let db = FirestoreService.shared.db
+        let existingTxsSnap = try? await db.collection("transmitters").getDocuments()
+        var pidToDocId: [String: String] = [:]
+        var txAnchors: [String: PlausibleAnchor] = [:]
+        if let docs = existingTxsSnap?.documents {
+            for d in docs {
+                let data = d.data()
+                let p = String(describing: data["platform_id"] ?? data["id"] ?? d.documentID)
+                    .replacingOccurrences(of: "^trans-", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !p.isEmpty {
+                    pidToDocId[p] = d.documentID
+                    let aLat = parseCoord(data["lat"] ?? data["latitude"] ?? data["last_latitude"])
+                    let aLon = parseCoord(data["lon"] ?? data["longitude"] ?? data["last_longitude"])
+                    let aTsStr = (data["lastFixAt"] as? String) ?? (data["last_fix"] as? String) ?? ""
+                    if let lat = aLat, let lon = aLon, lat != 0, lon != 0, !(abs(lat) < 1 && abs(lon) < 1),
+                       let tsSec = DateFormatters.parseDate(aTsStr)?.timeIntervalSince1970 {
+                        txAnchors[p] = PlausibleAnchor(lat: lat, lon: lon, tsSec: tsSec)
+                    }
+                }
+            }
+        }
+
+        let (positions, rejectedPosCount) = filterPlausibleRecords(rawPositions, anchors: txAnchors)
+        let (argosPositions, _) = filterPlausibleRecords(rawArgosPositions, anchors: txAnchors)
+        if rejectedPosCount > 0 {
+            logHandler("Rejected \(rejectedPosCount) implausible speed/distance outlier(s).")
+        }
+        logHandler("Valid positions extracted: \(positions.count).")
+
+        // Recompute txLastFixes strictly from accepted positions
+        var acceptedFixIdsByPtt: [String: (lastFix: String, lat: Double, lon: Double, tsSec: TimeInterval)] = [:]
+        for p in positions {
+            let pid = p["platformId"] as? String ?? ""
+            let ts = p["timestamp"] as? String ?? ""
+            let lat = p["lat"] as? Double ?? 0
+            let lon = p["lon"] as? Double ?? 0
+            let tsSec = DateFormatters.parseDate(ts)?.timeIntervalSince1970 ?? 0
+            if let cur = acceptedFixIdsByPtt[pid] {
+                if tsSec >= cur.tsSec {
+                    acceptedFixIdsByPtt[pid] = (ts, lat, lon, tsSec)
+                }
+            } else {
+                acceptedFixIdsByPtt[pid] = (ts, lat, lon, tsSec)
+            }
+        }
+        var txLastFixes: [String: TransmitterSyncInfo] = [:]
+        for (pid, best) in acceptedFixIdsByPtt {
+            txLastFixes[pid] = TransmitterSyncInfo(
+                lastFix: best.lastFix,
+                battery: rawTxLastFixes[pid]?.battery,
+                lat: best.lat,
+                lon: best.lon
+            )
+        }
+
+        // 4. Batch write to Firestore
         var importedCount = 0
         
         // Write positions in chunks of 400 (under Firestore 500 operation limit)
@@ -416,17 +563,6 @@ class ArgosAPIService {
         
         // 5. Update transmitters latest fix, coordinates & battery in Firestore
         logHandler("Updating metadata for \(txLastFixes.count) active transmitters...")
-        
-        let existingTxsSnap = try? await db.collection("transmitters").getDocuments()
-        var pidToDocId: [String: String] = [:]
-        if let docs = existingTxsSnap?.documents {
-            for d in docs {
-                let p = String(describing: d.data()["platform_id"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !p.isEmpty {
-                    pidToDocId[p] = d.documentID
-                }
-            }
-        }
         
         var txUpdatedCount = 0
         let txBatch = db.batch()
